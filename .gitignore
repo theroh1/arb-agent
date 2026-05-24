@@ -46,3 +46,7 @@ Thumbs.db
 *.tmp
 scratch/
 .ipynb_checkpoints/
+
+# Chat sessions — local-only by default, but keep the directory tracked
+.arb_chat_sessions/*
+!.arb_chat_sessions/.gitkeep

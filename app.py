@@ -25,6 +25,14 @@ from arb_agent.extractor import extract_from_bytes
 from arb_agent.checker import run_review, DEFAULT_MODEL
 from arb_agent.reporter import build_markdown_report, build_docx_report
 from arb_agent.standards import STANDARDS
+from arb_agent.chat import send_chat_message, ChatSession
+from arb_agent.chat_store import (
+    compute_hld_id,
+    load_session,
+    save_session,
+    delete_session,
+)
+from datetime import datetime as _dt
 
 
 # =============================================================================
@@ -169,6 +177,41 @@ ACCENTURE_CSS = """
   .status-warn  { color: var(--high); font-weight: 700; }
   .status-some  { color: var(--medium); font-weight: 600; }
   .status-err   { color: var(--high); font-weight: 700; }
+
+  /* Chat section (new) */
+  .chat-message-user {
+    background: #F4E5FF;
+    padding: 12px 16px;
+    border-radius: 14px 14px 4px 14px;
+    margin: 8px 0 8px 60px;
+    color: #1A1A1A;
+  }
+  .chat-message-assistant {
+    background: #FFFFFF;
+    border: 1px solid #D9D9D9;
+    padding: 12px 16px;
+    border-radius: 14px 14px 14px 4px;
+    margin: 8px 60px 8px 0;
+    color: #1A1A1A;
+  }
+  .chat-timestamp {
+    font-family: monospace;
+    font-size: 11px;
+    color: #8E8E8E;
+    margin: 4px 0 2px 0;
+  }
+  .chat-empty-hint {
+    color: #525252;
+    font-style: italic;
+    padding: 24px;
+    text-align: center;
+  }
+  .chat-empty-hint ul {
+    text-align: left;
+    max-width: 480px;
+    margin: 12px auto;
+    padding-left: 24px;
+  }
 </style>
 """
 st.markdown(ACCENTURE_CSS, unsafe_allow_html=True)
@@ -213,6 +256,53 @@ def get_region() -> str:
 
 def get_model() -> str:
     return _secret_or_env("BEDROCK_MODEL_ID", DEFAULT_MODEL)
+
+
+# =============================================================================
+# Rendering helpers
+# Moved here from the bottom of the file so they are in scope when called
+# from the finding-expander loop below. Bodies are unchanged.
+# =============================================================================
+def _escape(text: str) -> str:
+    """Minimal HTML escape for user-rendered values."""
+    return (
+        (text or "—")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _render_finding(std_display_id: str, idx: int, f):
+    """Render a single finding card."""
+    finding_id = f"F-{std_display_id}.{idx}"
+    sev_class = f.severity.lower()
+    pill_class = f"pill-{sev_class}"
+
+    html = f"""
+    <div class="finding {sev_class}">
+      <h4>
+        <span style="color:#525252;font-weight:600;">{finding_id}</span>
+        &nbsp;&nbsp;
+        <span class="pill {pill_class}">{f.severity.upper()}</span>
+        &nbsp;&nbsp;
+        {f.check_id} &nbsp; {f.check_name}
+      </h4>
+
+      <div class="field-label">Issue</div>
+      <div class="field-value">{_escape(f.issue)}</div>
+
+      <div class="field-label">Evidence — {_escape(f.evidence_section)}</div>
+      <div class="quote">{_escape(f.evidence_quote)}</div>
+
+      <div class="field-label">Authority</div>
+      <div class="field-value">{_escape(f.authority)}</div>
+
+      <div class="field-label">Recommendation</div>
+      <div class="field-value">{_escape(f.recommendation)}</div>
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
 
 
 # =============================================================================
@@ -292,43 +382,61 @@ if uploaded is not None:
     if st.session_state.get("review_started"):
         hld = st.session_state["hld"]
 
-        # Progress UI
-        st.markdown(f"_Running against `{model}` — evaluating against ten standards in sequence._")
-        progress_bar = st.progress(0.0, text="Starting...")
-        status_placeholder = st.empty()
-        status_lines = []
-
-        def on_progress(idx, standard, status):
-            if status == "start":
-                status_lines.append(f"⏳ **{standard.display_id} — {standard.name}**")
-            else:
-                # Remove the "in progress" version
-                status_lines[-1] = (
-                    f"✅ **{standard.display_id} — {standard.name}**"
-                    if status == "done"
-                    else f"⚠ **{standard.display_id} — {standard.name}** (error)"
-                )
-                progress_bar.progress(
-                    (idx + 1) / len(STANDARDS),
-                    text=f"Done {idx + 1}/{len(STANDARDS)} standards",
-                )
-            status_placeholder.markdown(
-                "\n\n".join(status_lines)
-            )
-
-        # Run the review
-        start = time.time()
-        review = run_review(
-            hld_text=hld.text,
-            hld_filename=hld.filename,
-            region=region,
-            model=model,
-            progress=on_progress,
+        # Cache the ReviewResult in session_state so that subsequent reruns
+        # (e.g. chat messages, button clicks) don't re-fire the 10-call
+        # Bedrock review. Recompute only if this is a different HLD.
+        need_review = (
+            "review_result" not in st.session_state
+            or st.session_state.get("review_hld_filename") != hld.filename
         )
-        elapsed = time.time() - start
 
-        status_placeholder.empty()
-        progress_bar.empty()
+        if need_review:
+            # Progress UI
+            st.markdown(f"_Running against `{model}` — evaluating against ten standards in sequence._")
+            progress_bar = st.progress(0.0, text="Starting...")
+            status_placeholder = st.empty()
+            status_lines = []
+
+            def on_progress(idx, standard, status):
+                if status == "start":
+                    status_lines.append(f"⏳ **{standard.display_id} — {standard.name}**")
+                else:
+                    # Remove the "in progress" version
+                    status_lines[-1] = (
+                        f"✅ **{standard.display_id} — {standard.name}**"
+                        if status == "done"
+                        else f"⚠ **{standard.display_id} — {standard.name}** (error)"
+                    )
+                    progress_bar.progress(
+                        (idx + 1) / len(STANDARDS),
+                        text=f"Done {idx + 1}/{len(STANDARDS)} standards",
+                    )
+                status_placeholder.markdown(
+                    "\n\n".join(status_lines)
+                )
+
+            # Run the review
+            start = time.time()
+            review = run_review(
+                hld_text=hld.text,
+                hld_filename=hld.filename,
+                region=region,
+                model=model,
+                progress=on_progress,
+            )
+            elapsed = time.time() - start
+
+            status_placeholder.empty()
+            progress_bar.empty()
+
+            # Cache for subsequent reruns
+            st.session_state["review_result"] = review
+            st.session_state["review_elapsed"] = elapsed
+            st.session_state["review_hld_filename"] = hld.filename
+            st.session_state["hld_text"] = hld.text
+        else:
+            review = st.session_state["review_result"]
+            elapsed = st.session_state["review_elapsed"]
 
         # =====================================================================
         # Display report
@@ -445,47 +553,103 @@ if uploaded is not None:
                 for idx, f in enumerate(r.findings, start=1):
                     _render_finding(r.standard.display_id, idx, f)
 
+        # === CHAT SECTION (new) ===
+        st.divider()
 
-def _render_finding(std_display_id: str, idx: int, f):
-    """Render a single finding card."""
-    finding_id = f"F-{std_display_id}.{idx}"
-    sev_class = f.severity.lower()
-    pill_class = f"pill-{sev_class}"
+        # Compute (or recover) hld_id and chat session, keyed by HLD identity
+        hld_text_cached = st.session_state["hld_text"]
+        current_hld_id = compute_hld_id(hld.filename, hld_text_cached)
 
-    html = f"""
-    <div class="finding {sev_class}">
-      <h4>
-        <span style="color:#525252;font-weight:600;">{finding_id}</span>
-        &nbsp;&nbsp;
-        <span class="pill {pill_class}">{f.severity.upper()}</span>
-        &nbsp;&nbsp;
-        {f.check_id} &nbsp; {f.check_name}
-      </h4>
+        # If the HLD changed since last render, drop the in-memory chat
+        if st.session_state.get("chat_hld_id") != current_hld_id:
+            st.session_state["chat_hld_id"] = current_hld_id
+            st.session_state.pop("chat_session", None)
 
-      <div class="field-label">Issue</div>
-      <div class="field-value">{_escape(f.issue)}</div>
+        # Load (from disk, or fresh) on first render after upload
+        if st.session_state.get("chat_session") is None:
+            st.session_state["chat_session"] = load_session(current_hld_id)
 
-      <div class="field-label">Evidence — {_escape(f.evidence_section)}</div>
-      <div class="quote">{_escape(f.evidence_quote)}</div>
+        chat_session = st.session_state["chat_session"]
 
-      <div class="field-label">Authority</div>
-      <div class="field-value">{_escape(f.authority)}</div>
+        with st.expander(
+            "💬 Chat with the agent",
+            expanded=bool(st.session_state.get("chat_expanded", False)),
+        ):
+            st.caption(
+                "Ask follow-up questions about any finding, request fixes, "
+                "or explore the design's risks. The chat has full context "
+                "of the HLD and all findings produced above."
+            )
 
-      <div class="field-label">Recommendation</div>
-      <div class="field-value">{_escape(f.recommendation)}</div>
-    </div>
-    """
-    st.markdown(html, unsafe_allow_html=True)
+            # Right-aligned "Clear chat history" button
+            _, btn_col = st.columns([5, 1])
+            with btn_col:
+                if st.button("Clear chat history", key="chat_clear",
+                             use_container_width=True):
+                    delete_session(current_hld_id)
+                    st.session_state["chat_session"] = None
+                    st.session_state["chat_expanded"] = False
+                    st.rerun()
 
+            # History or empty state
+            if not chat_session.messages:
+                st.markdown(
+                    '<div class="chat-empty-hint">'
+                    'Try one of these to get started:'
+                    '<ul>'
+                    '<li>Why was finding 1.C flagged?</li>'
+                    '<li>What are my top three high-severity risks?</li>'
+                    '<li>Propose a revised paragraph for the e-SIM bar '
+                    'section that addresses 1.C.</li>'
+                    '</ul>'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                for msg in chat_session.messages:
+                    if msg.role == "user":
+                        st.markdown(
+                            f'<div class="chat-timestamp" '
+                            f'style="text-align:right;margin-right:60px;">'
+                            f'{msg.timestamp}</div>'
+                            f'<div class="chat-message-user">'
+                            f'{_escape(msg.content)}</div>',
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        st.markdown(
+                            f'<div class="chat-timestamp" '
+                            f'style="margin-left:0;">'
+                            f'{msg.timestamp}</div>',
+                            unsafe_allow_html=True,
+                        )
+                        # Render assistant content with markdown so code
+                        # blocks and lists format properly. Wrap in the
+                        # assistant-bubble container via opening/closing divs.
+                        st.markdown(
+                            '<div class="chat-message-assistant">',
+                            unsafe_allow_html=True,
+                        )
+                        st.markdown(msg.content)
+                        st.markdown('</div>', unsafe_allow_html=True)
 
-def _escape(text: str) -> str:
-    """Minimal HTML escape for user-rendered values."""
-    return (
-        (text or "—")
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+            # Chat input at the bottom
+            user_input = st.chat_input(
+                placeholder="Ask about any finding, the HLD, "
+                            "or request a fix...",
+            )
+            if user_input:
+                with st.spinner("Thinking…"):
+                    send_chat_message(
+                        session=chat_session,
+                        user_message=user_input,
+                        review=review,
+                        hld_text=hld_text_cached,
+                        model=model,
+                    )
+                save_session(chat_session)
+                st.session_state["chat_expanded"] = True
+                st.rerun()
 
 
 # =============================================================================

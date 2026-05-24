@@ -36,6 +36,25 @@ ProgressCallback = Callable[[int, Standard, str], None]
 # args: (index 0-based, standard, status: "start" | "done" | "error")
 
 
+def build_client(region: Optional[str] = None):
+    """Construct a Bedrock runtime client.
+
+    Resolves region from the argument, then AWS_REGION / AWS_DEFAULT_REGION
+    env vars, finally DEFAULT_REGION. Authentication uses the standard boto3
+    credential chain (including AWS_BEARER_TOKEN_BEDROCK if set).
+
+    Reused by chat.py so follow-up conversations call Bedrock the same way
+    run_review does — same region resolution, same client construction.
+    """
+    region = (
+        region
+        or os.environ.get("AWS_REGION")
+        or os.environ.get("AWS_DEFAULT_REGION")
+        or DEFAULT_REGION
+    )
+    return boto3.client("bedrock-runtime", region_name=region)
+
+
 def run_review(
     hld_text: str,
     hld_filename: str,
@@ -50,9 +69,8 @@ def run_review(
     before this function runs.
     """
     model = model or os.environ.get("BEDROCK_MODEL_ID", DEFAULT_MODEL)
-    region = region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or DEFAULT_REGION
 
-    client = boto3.client("bedrock-runtime", region_name=region)
+    client = build_client(region)
 
     review = ReviewResult(hld_filename=hld_filename, model=model)
 
